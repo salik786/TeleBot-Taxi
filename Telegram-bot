@@ -1,0 +1,487 @@
+import telegram
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, JobQueue
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+import asyncio
+from geopy.geocoders import Nominatim
+from geopy.distance import geodesic
+import re
+import random
+import os
+import logging
+import requests
+import json
+import csv
+# Enable logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+def load_suburbs(csv_file="suburbs.csv"):
+    suburbs = set()
+    try:
+        with open(csv_file, 'r', encoding='utf-8') as file:
+            reader = csv.DictReader(file)
+            for row in reader:
+                suburbs.add(row['suburb'].strip().lower())  # Use 'suburb' key
+    except FileNotFoundError:
+        logger.error(f"Suburb CSV file '{csv_file}' not found. Please make sure you have the file.")
+        return set()
+    except KeyError:  # Handle potential KeyError if 'suburb' column is missing
+        logger.error(f"CSV file '{csv_file}' does not contain a 'suburb' column.")
+        return set()
+    except Exception as e:
+        logger.error(f"Error reading CSV file: {e}")
+        return set()
+    return suburbs
+suburbs = load_suburbs()
+# Get the bot token from environment variable
+TOKEN = "7675734146:AAFG8qtAqqi2_iB53UyFwrvhqsGPsm2ZsfE"
+if not TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
+
+# States for conversation
+SELECTING_CAR_TYPE = 1
+
+@dataclass
+class DriverPreferences:
+    car_type: list  # Now a list of car types
+   
+    max_distance_minutes: int = 15
+    current_location: tuple = None
+    watched_groups: set = None
+
+    def __post_init__(self):
+        if self.watched_groups is None:
+            self.watched_groups = set()
+
+@dataclass
+class Job:
+    raw_text: str
+    pickup_location: str
+    car_type: str = "any"
+    payment_type: str = None
+    ready_time: str = "now"
+    timestamp: datetime = None
+
+    def __post_init__(self):
+        self.timestamp = datetime.now()
+
+class DriverBot:
+    def __init__(self):
+        self.active = False
+        self.preferences = None
+        self.geolocator = Nominatim(user_agent="driver_bot")
+        self.location_cache = {}
+        self.car_types = {
+            "sedan": ["sedan", "car", "normal"],
+            "suv": ["suv", "4wd"],
+            "maxi": ["maxi", "van", "people mover","7 seater"],
+            "wheelchair": ["wheelchair", "wc", "accessible"],
+            "baby": ["baby seat", "baby", "child seat"],
+            "any": ["any", "any car"],
+            "11 seater" : ["Only 11 Seater"]
+        }
+        self.payment_types = ["cabcharge", "tts", "age"]
+
+    def _parse_car_type(self, text: str) -> str:
+        text_lower = text.lower()
+        for car_type, keywords in self.car_types.items():
+            if any(keyword in text_lower for keyword in keywords):
+                return car_type
+        return "any"
+
+    def _parse_payment_type(self, text: str) -> str:
+        text_lower = text.lower()
+        for payment in self.payment_types:
+            if payment in text_lower:
+                return payment
+        return None
+
+    def _parse_ready_time(self, text: str) -> str:
+        text_lower = text.lower()
+        if any(keyword in text_lower for keyword in ["ready now", "rd", "ready"]):
+            return "now"
+        time_pattern = r'(\d+)(?:-(\d+))?\s*(?:minutes?|mins?|mnt)'
+        match = re.search(time_pattern, text_lower)
+        if match:
+            return f"{match.group(1)} minutes"
+        return "unknown"
+
+    async def get_location_coords(self, location_name: str) -> tuple:
+        if location_name in self.location_cache:
+            logger.info(f"Using cached coordinates for {location_name}: {self.location_cache[location_name]}")
+            return self.location_cache[location_name]
+        try:
+            location = self.geolocator.geocode(f"{location_name}, Sydney, Australia")
+            if location:
+                coords = (location.latitude, location.longitude)
+                self.location_cache[location_name] = coords
+                logger.info(f"Geocoded {location_name} to: {coords}")
+                return coords
+            else:
+                logger.warning(f"Could not geocode location: {location_name}")
+                return None
+        except Exception as e:
+            logger.error(f"Error geocoding location: {e}")
+            return None
+    async def parse_job(self, text: str) -> Job:
+        car_type = self._parse_car_type(text)
+        payment_type = self._parse_payment_type(text)
+        ready_time = self._parse_ready_time(text)
+        pickup_location = "unknown"
+        dropoff_location = None
+        price = None
+
+        text = text.replace('\xa0', ' ').strip()  # Remove non-breaking spaces and strip
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+
+        if not lines:  # Handle empty messages
+            logger.warning("Empty message received. Cannot parse.")
+            return Job(raw_text=text, pickup_location=pickup_location, car_type=car_type, payment_type=payment_type, ready_time=ready_time)
+
+
+        # 1. Ready/Rd/Rn format
+        if lines and any(lines[0].lower().startswith(prefix) for prefix in ("ready", "rd", "rn")):
+            ready_time = "now" if any(keyword in lines[0].lower() for keyword in ["now", "asap"]) else ready_time
+            pickup_found = False
+            for i, line in enumerate(lines[1:]):
+                if line.lower() == "to":
+                    if i + 1 < len(lines[1:]):
+                        pickup_location = lines[i].strip()
+                        dropoff_location = lines[i + 2].strip() if i + 2 < len(lines[1:]) else None
+                        try:
+                            price_line_index = -1
+                            for j in range(len(lines) - 1, -1, -1):  # Iterate from the end
+                                try:
+                                    price = float(re.sub(r'[$,/-]', '', lines[j]))
+                                    price_line_index = j
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+                            if price_line_index != -1:
+                                logger.info(f"Detected format 1 (with dropoff). Pickup: {pickup_location}, Dropoff: {dropoff_location}, Price: {price}")
+                            else:
+                                logger.info(f"Detected format 1 (with dropoff). Pickup: {pickup_location}, Dropoff: {dropoff_location}, No Price Found")
+                        except (ValueError, IndexError):
+                            pass
+
+                        pickup_found = True
+                        break
+                elif not pickup_found and line.lower() in suburbs:
+                    pickup_location = line
+                    try:
+                            price_line_index = -1
+                            for j in range(len(lines)-1, -1, -1):
+                                try:
+                                    price = float(re.sub(r'[$,/-]', '', lines[j]))
+                                    price_line_index = j
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+                            if price_line_index != -1:
+                                logger.info(f"Detected format 1 (no dropoff). Pickup: {pickup_location}, Price: {price}")
+                            else:
+                                logger.info(f"Detected format 1 (no dropoff). Pickup: {pickup_location}, No Price Found")
+                    except (ValueError, IndexError):
+                        pass
+                    pickup_found = True
+                    break
+
+        # 2. "Pickup ... Dropoff ..." format
+        elif "pickup" in text.lower() and "dropoff" in text.lower():
+            match = re.search(r"pickup\s+([A-Za-z\s]+),\s*dropoff\s+([A-Za-z\s]+)", text, re.IGNORECASE)
+            if match:
+                pickup_location = match.group(1).strip()
+                dropoff_location = match.group(2).strip()
+                try:
+                    price = float(re.sub(r'[$,/-]', '', lines[-1]))
+                except (ValueError, IndexError):
+                    pass
+                logger.info(f"Detected format 2. Pickup: {pickup_location}, Dropoff: {dropoff_location}, Price: {price}")
+
+        # 3. "... to ..." format
+        elif " to " in text.lower():
+            parts = text.lower().split(" to ")
+            if len(parts) == 2:
+                pickup_location = parts[0].strip()
+                dropoff_location = parts[1].strip()
+                try:
+                    price = float(re.sub(r'[$,/-]', '', lines[-1]))
+                except (ValueError, IndexError):
+                    pass
+                logger.info(f"Detected format 3. Pickup: {pickup_location}, Dropoff: {dropoff_location}, Price: {price}")
+
+        # 4. Single Location (e.g., just "Greenacre")
+        elif len(lines) == 1 and lines[0].lower() in suburbs:
+            pickup_location = lines[0].strip()
+            try:
+                price = float(re.sub(r'[$,/-]', '', lines[-1]))
+            except (ValueError, IndexError):
+                pass
+            logger.info(f"Detected format 4. Pickup: {pickup_location}, Price: {price}")
+
+        if dropoff_location:
+            pickup_location = f"{pickup_location} to {dropoff_location}"
+
+        logger.info(f"Parsed pickup location: {pickup_location}")
+        return Job(raw_text=text, pickup_location=pickup_location, car_type=car_type, payment_type=payment_type, ready_time=ready_time)
+    async def calculate_drive_time(self, coord1: tuple, coord2: tuple) -> int:
+        if not coord1 or not coord2:
+            return None
+        try:
+            url = f"http://router.project-osrm.org/route/v1/driving/{coord1[1]},{coord1[0]};{coord2[1]},{coord2[0]}?overview=false"
+            response = requests.get(url)
+            response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+            data = response.json()
+
+            if data["code"] == "Ok":
+                duration = data["routes"][0]["duration"]  # Duration in seconds
+                minutes = round(duration / 60)
+                logger.info(f"OSRM Response: {data}")
+                return minutes
+            else:
+                logger.warning(f"OSRM returned an error: {data['code']}")
+                return None
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"OSRM request error: {e}")
+            return None
+        except (KeyError, IndexError) as e:
+            logger.error(f"Error parsing OSRM response: {e}")
+            return None
+
+    async def should_bid(self, job: Job) -> bool:
+        
+        if not self.active or not self.preferences or not self.preferences.current_location:
+            return False  
+        if not self.active:
+            logger.info("Bot is inactive, not bidding.")
+            return False
+        if not self.preferences:
+            logger.info("Preferences not set, not bidding.")
+            return False
+        if not self.preferences.current_location:
+            logger.info("Current location not set, not bidding.")
+            return False
+
+        if "any" not in job.car_type and not any(driver_car_type in job.car_type for driver_car_type in self.preferences.car_type) and "any" not in self.preferences.car_type:
+            logger.info(f"Car type mismatch. Job requires {job.car_type}, driver has {self.preferences.car_type}. Not bidding.")
+            return False
+
+        if job.pickup_location != "unknown":
+            pickup_coords = await self.get_location_coords(job.pickup_location)  # Geocode pickup ONLY
+            if pickup_coords:
+                drive_time = await self.calculate_drive_time(self.preferences.current_location, pickup_coords)
+                if drive_time is not None:
+                    logger.info(f"Drive time to {job.pickup_location}: {drive_time} minutes")
+                    if drive_time > self.preferences.max_distance_minutes:
+                        logger.info(f"Drive time {drive_time} exceeds max distance {self.preferences.max_distance_minutes}. Not bidding.")
+                        return False
+                else:
+                    logger.warning("Could not calculate drive time. Not bidding.")
+                    return False
+            else:
+                logger.warning("Could not get pickup coordinates. Not bidding.") # This log is now correct
+                return False
+
+        logger.info("All checks passed. Should bid.")
+        return True
+
+    async def _update_location(self, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = context.user_data.get('private_chat_id') # Get chat_id from user_data
+
+        if not chat_id:
+            print("No private chat id found to update location")
+            return
+
+        try:
+            keyboard = [[KeyboardButton("Share Location", request_location=True)]]
+            reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Please share your current location.",
+                reply_markup=reply_markup,
+            )
+        except telegram.error.TelegramError as e:
+            print(f"Error requesting location update: {e}")
+    async def start_location_updates(self, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = context.user_data.get('private_chat_id')
+        if not chat_id:
+            print("No private chat ID found to start location updates.")
+            return
+
+        current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+        if current_jobs:
+            print(f"Location update job already running for chat {chat_id}")
+            return
+
+        await self._update_location(context)  # Request location immediately
+
+        context.job_queue.run_repeating(
+            self._update_location,
+            interval=timedelta(minutes=2),
+            first=timedelta(minutes=2),
+            chat_id=chat_id,
+            name=str(chat_id)
+        )
+        print(f"Started location updates for chat {chat_id}")
+    async def stop_location_updates(self, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = context.user_data.get('private_chat_id')
+        if not chat_id:
+            return
+
+        jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+        for job in jobs:
+            job.schedule_removal()
+        print(f"Stopped location updates for chat {chat_id}")
+
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.message.chat.type != 'private':
+            await update.message.reply_text("Please start a private chat with me to set up your preferences.")
+            return ConversationHandler.END
+
+        keyboard = [[KeyboardButton("Share Location", request_location=True)]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        await update.message.reply_text("Welcome! Please share your location.", reply_markup=reply_markup)
+        return SELECTING_CAR_TYPE
+
+    async def handle_location(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.message or not update.message.location:
+            return
+        try:
+            location = update.message.location
+            if self.preferences is None:
+                self.preferences = DriverPreferences(car_type="any")
+            self.preferences.current_location = (location.latitude, location.longitude)
+            logger.info(f"Current Location: {self.preferences.current_location}") #Log current location
+            await update.message.reply_text("Location updated!")
+        except AttributeError:
+            await update.message.reply_text("Please share your location to calculate drive time.")
+
+
+    async def select_car_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.message:
+            return ConversationHandler.END
+
+        selected_car_types = [car.strip().lower() for car in update.message.text.split(",")] # Split by comma
+        invalid_car_types = [car for car in selected_car_types if car not in self.car_types and car != "any"]
+        if invalid_car_types:
+            await update.message.reply_text(f"Invalid car type(s): {', '.join(invalid_car_types)}. Please select valid car types separated by commas.")
+            return SELECTING_CAR_TYPE
+
+        self.preferences.car_type = selected_car_types
+        keyboard = [[KeyboardButton("Activate Bot"), KeyboardButton("Deactivate Bot")]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text(f"Car type(s) set to: {', '.join(self.preferences.car_type)}. Activate/Deactivate?", reply_markup=reply_markup)
+        return ConversationHandler.END
+
+    async def cmd_activate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.preferences or not self.preferences.current_location:
+            await update.message.reply_text("Please share your location and set your car type first using /start.")
+            return
+
+        self.active = True
+        context.user_data['private_chat_id'] = update.effective_chat.id
+        await self.start_location_updates(context)
+        await update.message.reply_text("Bot activated! Watching for suitable jobs.")
+
+    async def cmd_deactivate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.active = False
+        await self.stop_location_updates(context)
+        await update.message.reply_text("Bot deactivated!")
+    async def cmd_add_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Add current group to watched groups"""
+        if self.preferences is None:
+            await update.message.reply_text("Please set your preferences first using /start")
+            return
+        if update.message.chat.type in ['group', 'supergroup']:
+            if self.preferences.watched_groups is None:
+                self.preferences.watched_groups = set()
+            self.preferences.watched_groups.add(update.message.chat.id)
+            logger.info(f"Added group {update.message.chat.id} to watched groups: {self.preferences.watched_groups}")
+            await update.message.reply_text("Added this group to watched groups!")
+        else:
+            await update.message.reply_text("This command can only be used in groups.")
+    async def handle_buttons(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.message or not update.message.text:
+            return
+
+        text = update.message.text
+        if text == "Activate Bot":
+            await self.cmd_activate(update, context)
+        elif text == "Deactivate Bot":
+            await self.cmd_deactivate(update, context)
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info(f"Received message: {update.message.text} from chat ID: {update.message.chat.id} (Type: {update.message.chat.type})")
+        if not self.active or not self.preferences or not self.preferences.current_location:
+            logger.info("Bot is not active or preferences not set. Ignoring message.")
+            return
+
+        if update.message.chat.type not in ['group', 'supergroup']:
+            logger.info("Message is not from a group. Ignoring.")
+            return
+
+        text = update.message.text
+        try:
+            job = await self.parse_job(text)
+            logger.info(f"Parsed Job: {job.__dict__}")
+          
+            if await self.should_bid(job): # This is where the check happens
+                pickup_coords = await self.get_location_coords(job.pickup_location)
+                if pickup_coords:
+                    drive_time = await self.calculate_drive_time(self.preferences.current_location, pickup_coords)
+                    if drive_time is not None and drive_time <= self.preferences.max_distance_minutes:
+                        await asyncio.sleep(0.5 + random.random())
+                        await update.message.reply_text("1")
+
+                        drive_time_str = f"{drive_time} minutes" if drive_time is not None else "unknown"
+
+                        notification = (
+                            f"🚨 Bid placed!\n"
+                            f"📍 Pickup: {job.pickup_location}\n"
+                            f"🚗 Car Type: {job.car_type}\n"
+                            f"⏰ Ready: {job.ready_time}\n"
+                            f"💳 Payment: {job.payment_type or 'Not specified'}\n"
+                            f"🕒 Drive time: {drive_time_str}"
+                            f"Group: {update.message.chat.title} (ID: {update.message.chat.id})"  # Include group info
+                        )
+
+                        if 'private_chat_id' in context.user_data:
+                            try:
+                                await context.bot.send_message(chat_id=context.user_data['private_chat_id'], text=notification)
+                            except telegram.error.TelegramError as e:
+                                print(f"Error sending notification: {e}")
+                        else:
+                            print("Private chat ID not found. Cannot send notification.")
+        except Exception as e:
+            logger.error(f"Error handling message: {e}")
+            await update.message.reply_text(f"An error occurred: {e}", quote=True)
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    bot = DriverBot()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', bot.cmd_start)],
+        states={
+            SELECTING_CAR_TYPE: [
+                MessageHandler(filters.LOCATION, bot.handle_location),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.select_car_type)
+            ]
+        },
+        fallbacks=[],
+    )
+
+    app.add_handler(conv_handler)
+    app.add_handler(MessageHandler(filters.Regex("^(Activate Bot|Deactivate Bot)$"), bot.handle_buttons))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, bot.handle_message)) #Correct handler
+    app.add_handler(CommandHandler("activate", bot.cmd_activate))
+    app.add_handler(CommandHandler("deactivate", bot.cmd_deactivate))
+
+    print("Bot is starting...")
+    app.job_queue.run_once(lambda context: print("Job queue started"), 0)
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
